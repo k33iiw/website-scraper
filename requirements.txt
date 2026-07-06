@@ -3,4 +3,5 @@ beautifulsoup4
 playwright
 python-dotenv
 openai
+google-genai
 requests

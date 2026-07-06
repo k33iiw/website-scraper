@@ -29,15 +29,22 @@ except ImportError:
 # Streamlit page config must be the first Streamlit UI command.
 st.set_page_config(page_title="AI Website Scraper", layout="wide")
 
-ENV_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
-st.caption(f".env path: {ENV_PATH}")
-st.caption(f"OpenAI API key loaded: {'Yes' if ENV_OPENAI_API_KEY else 'No'}")
 st.title("AI Website Scraper")
 st.write(
     "Detect same-domain links, manually select two or more pages, scrape them, "
     "and optionally use AI to extract structured JSON."
 )
+
+
+def get_secret(name: str, default: str = "") -> str:
+    """Read secrets from .env/environment first, then Streamlit secrets for cloud deployment."""
+    env_value = os.getenv(name, "")
+    if env_value:
+        return env_value
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
 
 
 # ── OpenAI pricing (USD per 1M tokens) ────────────────────────────────────────
@@ -50,6 +57,14 @@ OPENAI_PRICING = {
     "gpt-5-mini": {"input": 0.25, "cached_input": 0.025, "output": 2.00},
 }
 DEFAULT_PRICING_MODEL = "gpt-4o-mini"
+
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+
 
 SKIP_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
@@ -414,22 +429,33 @@ def estimate_openai_cost(model: str, usage) -> dict:
     }
 
 
+def _sum_numeric(values: list) -> float | None:
+    numeric_values = [v for v in values if isinstance(v, (int, float))]
+    if not numeric_values:
+        return None
+    return round(sum(numeric_values), 8)
+
+
 def combine_usage(usages: list[dict | None]) -> dict | None:
     valid = [u for u in usages if isinstance(u, dict)]
     if not valid:
         return None
+
+    cost_total = _sum_numeric([u.get("estimated_total_cost_usd") for u in valid])
+
     return {
+        "provider": valid[-1].get("provider", ""),
         "model_used": valid[-1].get("model_used", ""),
         "pricing_model": valid[-1].get("pricing_model", ""),
-        "input_tokens": sum(u.get("input_tokens", 0) for u in valid),
-        "normal_input_tokens": sum(u.get("normal_input_tokens", 0) for u in valid),
-        "cached_input_tokens": sum(u.get("cached_input_tokens", 0) for u in valid),
-        "output_tokens": sum(u.get("output_tokens", 0) for u in valid),
-        "total_tokens": sum(u.get("total_tokens", 0) for u in valid),
-        "input_cost_usd": round(sum(u.get("input_cost_usd", 0) for u in valid), 8),
-        "cached_input_cost_usd": round(sum(u.get("cached_input_cost_usd", 0) for u in valid), 8),
-        "output_cost_usd": round(sum(u.get("output_cost_usd", 0) for u in valid), 8),
-        "estimated_total_cost_usd": round(sum(u.get("estimated_total_cost_usd", 0) for u in valid), 8),
+        "input_tokens": sum(u.get("input_tokens", 0) or 0 for u in valid),
+        "normal_input_tokens": sum(u.get("normal_input_tokens", 0) or 0 for u in valid),
+        "cached_input_tokens": sum(u.get("cached_input_tokens", 0) or 0 for u in valid),
+        "output_tokens": sum(u.get("output_tokens", 0) or 0 for u in valid),
+        "total_tokens": sum(u.get("total_tokens", 0) or 0 for u in valid),
+        "input_cost_usd": _sum_numeric([u.get("input_cost_usd") for u in valid]),
+        "cached_input_cost_usd": _sum_numeric([u.get("cached_input_cost_usd") for u in valid]),
+        "output_cost_usd": _sum_numeric([u.get("output_cost_usd") for u in valid]),
+        "estimated_total_cost_usd": cost_total,
         "pricing_usd_per_1m_tokens": valid[-1].get("pricing_usd_per_1m_tokens", {}),
     }
 
@@ -540,6 +566,29 @@ EXTRACTION_SCHEMA = {
 }
 
 
+def extract_json_from_text(output_text: str) -> dict:
+    """Parse JSON from a model response. Handles plain JSON and simple fenced output."""
+    text = (output_text or "").strip()
+    if not text:
+        return {"raw_output": ""}
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback for responses that accidentally include markdown fences or extra text.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    return {"raw_output": output_text}
+
+
 def openai_json_call(api_key: str, model: str, messages: list[dict], schema_name: str, schema: dict) -> dict:
     try:
         from openai import OpenAI
@@ -566,16 +615,97 @@ def openai_json_call(api_key: str, model: str, messages: list[dict], schema_name
     output_text = response.choices[0].message.content if response.choices else ""
     usage = getattr(response, "usage", None)
     cost = estimate_openai_cost(model, usage) if usage else None
+    if cost:
+        cost["provider"] = "OpenAI"
 
     if not output_text:
         return {"error": "OpenAI returned an empty response.", "usage": cost}
 
-    try:
-        data = json.loads(output_text)
-    except json.JSONDecodeError:
-        data = {"raw_output": output_text}
+    return {"data": extract_json_from_text(output_text), "usage": cost}
 
-    return {"data": data, "usage": cost}
+
+def estimate_gemini_usage(model: str, usage_metadata) -> dict:
+    input_tokens = getattr(usage_metadata, "prompt_token_count", 0) or 0
+    output_tokens = getattr(usage_metadata, "candidates_token_count", 0) or 0
+    total_tokens = getattr(usage_metadata, "total_token_count", input_tokens + output_tokens) or (input_tokens + output_tokens)
+
+    return {
+        "provider": "Gemini",
+        "model_used": model,
+        "pricing_model": "N/A - Gemini pricing is not calculated by this app",
+        "input_tokens": input_tokens,
+        "normal_input_tokens": input_tokens,
+        "cached_input_tokens": 0,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "input_cost_usd": None,
+        "cached_input_cost_usd": None,
+        "output_cost_usd": None,
+        "estimated_total_cost_usd": None,
+        "pricing_usd_per_1m_tokens": {},
+    }
+
+
+def gemini_json_call(api_key: str, model: str, messages: list[dict], schema_name: str, schema: dict) -> dict:
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return {"error": "google-genai package not installed. Run: pip install google-genai"}
+
+    client = genai.Client(api_key=api_key)
+
+    prompt_parts = [
+        "Return valid JSON only. Do not include markdown, comments, or explanation.",
+        f"The JSON must match this schema named {schema_name}:",
+        json.dumps(schema, ensure_ascii=False),
+        "Conversation:",
+    ]
+    for message in messages:
+        role = message.get("role", "user").upper()
+        content = message.get("content", "")
+        prompt_parts.append(f"{role}:\n{content}")
+    prompt = "\n\n".join(prompt_parts)
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    output_text = getattr(response, "text", "") or ""
+    usage_metadata = getattr(response, "usage_metadata", None)
+    usage = estimate_gemini_usage(model, usage_metadata) if usage_metadata else {
+        "provider": "Gemini",
+        "model_used": model,
+        "pricing_model": "N/A - Gemini pricing is not calculated by this app",
+        "input_tokens": 0,
+        "normal_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "input_cost_usd": None,
+        "cached_input_cost_usd": None,
+        "output_cost_usd": None,
+        "estimated_total_cost_usd": None,
+        "pricing_usd_per_1m_tokens": {},
+    }
+
+    if not output_text:
+        return {"error": "Gemini returned an empty response.", "usage": usage}
+
+    return {"data": extract_json_from_text(output_text), "usage": usage}
+
+
+def ai_json_call(provider: str, api_key: str, model: str, messages: list[dict], schema_name: str, schema: dict) -> dict:
+    if provider == "Gemini":
+        return gemini_json_call(api_key, model, messages, schema_name, schema)
+    return openai_json_call(api_key, model, messages, schema_name, schema)
 
 
 def ai_choose_next_links(
@@ -586,6 +716,7 @@ def ai_choose_next_links(
     api_key: str,
     model: str,
     max_new_links: int,
+    provider: str = "OpenAI",
 ) -> dict:
     cleaned_candidates = []
     seen = set()
@@ -626,7 +757,7 @@ def ai_choose_next_links(
         },
     ]
 
-    result = openai_json_call(api_key, model, messages, "next_link_selection", LINK_SELECTION_SCHEMA)
+    result = ai_json_call(provider, api_key, model, messages, "next_link_selection", LINK_SELECTION_SCHEMA)
     if "error" in result:
         return result
 
@@ -645,7 +776,7 @@ def ai_choose_next_links(
     return result
 
 
-def ai_extract_from_scraped_pages(results: list[dict], task: str, api_key: str, model: str) -> dict:
+def ai_extract_from_scraped_pages(results: list[dict], task: str, api_key: str, model: str, provider: str = "OpenAI") -> dict:
     compact_pages = []
     all_downloads = []
 
@@ -690,7 +821,7 @@ def ai_extract_from_scraped_pages(results: list[dict], task: str, api_key: str, 
         },
     ]
 
-    return openai_json_call(api_key, model, messages, "ai_agent_extraction", EXTRACTION_SCHEMA)
+    return ai_json_call(provider, api_key, model, messages, "ai_agent_extraction", EXTRACTION_SCHEMA)
 
 
 # ── Crawl modes ────────────────────────────────────────────────────────────────
@@ -734,6 +865,7 @@ async def ai_agent_crawl(
     task: str,
     api_key: str,
     model: str,
+    provider: str,
     max_pages: int,
     max_depth: int,
     max_ai_links_per_round: int,
@@ -794,7 +926,7 @@ async def ai_agent_crawl(
             page_data["ai_selection_reason"] = selected.get("reason", "")
             results.append(page_data)
 
-    extraction = ai_extract_from_scraped_pages(results, task, api_key, model)
+    extraction = ai_extract_from_scraped_pages(results, task, api_key, model, provider)
     if extraction.get("usage"):
         usages.append(extraction["usage"])
 
@@ -842,11 +974,19 @@ async def whole_site_crawl(
 # ── UI helpers ────────────────────────────────────────────────────────────────
 def render_usage_panel(usage: dict):
     st.subheader("📊 API Usage & Estimated Cost")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("💰 Est. Cost (USD)", f"${usage['estimated_total_cost_usd']:.8f}")
-    c2.metric("📥 Input Tokens", f"{usage['input_tokens']:,}")
-    c3.metric("📤 Output Tokens", f"{usage['output_tokens']:,}")
-    c4.metric("🔢 Total Tokens", f"{usage['total_tokens']:,}")
+    cost = usage.get("estimated_total_cost_usd")
+    cost_display = f"${cost:.8f}" if isinstance(cost, (int, float)) else "N/A"
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("AI Provider", usage.get("provider") or "N/A")
+    c2.metric("💰 Est. Cost (USD)", cost_display)
+    c3.metric("📥 Input Tokens", f"{usage.get('input_tokens', 0):,}")
+    c4.metric("📤 Output Tokens", f"{usage.get('output_tokens', 0):,}")
+    c5.metric("🔢 Total Tokens", f"{usage.get('total_tokens', 0):,}")
+
+    if usage.get("provider") == "Gemini":
+        st.caption("Gemini token usage is shown when returned by the API. Cost is not estimated in this app.")
+
     with st.expander("🔍 Full cost breakdown"):
         st.json(usage)
 
@@ -896,20 +1036,32 @@ with st.sidebar:
     keep_duplicates = st.checkbox("Keep repeated text", value=True)
 
     st.divider()
-    st.subheader("OpenAI")
-    openai_api_key = os.getenv("OPENAI_API_KEY", "")
-    if openai_api_key:
-        st.success("OpenAI API key loaded from .env/environment.")
-    else:
-        st.warning("OPENAI_API_KEY not found. Add it to your .env file before using AI modes.")
+    st.subheader("AI Provider")
+    ai_provider = st.selectbox("Provider", ["OpenAI", "Gemini"])
 
-    openai_model = st.selectbox(
-        "Model",
-        list(OPENAI_PRICING.keys()) + ["other"],
-        index=list(OPENAI_PRICING.keys()).index("gpt-4o-mini"),
-    )
-    if openai_model == "other":
-        openai_model = st.text_input("Custom model name", placeholder="gpt-5")
+    openai_api_key = get_secret("OPENAI_API_KEY")
+    gemini_api_key = get_secret("GEMINI_API_KEY") or get_secret("GOOGLE_API_KEY")
+
+    if ai_provider == "OpenAI":
+        ai_api_key = openai_api_key
+        ai_model = st.selectbox(
+            "OpenAI model",
+            list(OPENAI_PRICING.keys()) + ["other"],
+            index=list(OPENAI_PRICING.keys()).index("gpt-4o-mini"),
+        )
+        if ai_model == "other":
+            ai_model = st.text_input("Custom OpenAI model name", placeholder="gpt-5")
+    else:
+        ai_api_key = gemini_api_key
+        ai_model = st.selectbox(
+            "Gemini model",
+            GEMINI_MODELS + ["other"],
+            index=0,
+        )
+        if ai_model == "other":
+            ai_model = st.text_input("Custom Gemini model name", placeholder="gemini-2.5-flash")
+
+    st.caption("API keys are loaded silently from environment variables or .env and are not displayed on the page.")
 
     st.divider()
     output_mode = st.selectbox(
@@ -1013,8 +1165,8 @@ if crawl_mode in manual_modes:
 if run_clicked:
     if not url:
         st.error("Please enter a website URL.")
-    elif crawl_mode != "Manual selected links only" and not openai_api_key:
-        st.error("OPENAI_API_KEY not found. Add it to your .env file before using AI modes.")
+    elif crawl_mode != "Manual selected links only" and not ai_api_key:
+        st.error(f"{ai_provider} API key not found. Add the correct key to your .env file, Streamlit secrets, or deployment environment variables.")
     elif crawl_mode != "Manual selected links only" and not ai_task.strip():
         st.error("Please describe what you want AI to scrape/extract.")
     else:
@@ -1058,8 +1210,8 @@ if run_clicked:
 
             if crawl_mode == "Manual selected links + AI extraction":
                 progress.progress(0.85)
-                status.write("Asking AI to extract structured JSON from your manually selected pages...")
-                extraction = ai_extract_from_scraped_pages(results, ai_task, openai_api_key, openai_model)
+                status.write(f"Asking {ai_provider} to extract structured JSON from your manually selected pages...")
+                extraction = ai_extract_from_scraped_pages(results, ai_task, ai_api_key, ai_model, ai_provider)
                 if extraction.get("error"):
                     st.error(extraction["error"])
                 st.session_state.ai_output = extraction
@@ -1067,12 +1219,13 @@ if run_clicked:
                 progress.progress(1.0)
 
         elif crawl_mode == "AI follows links step-by-step":
-            status.write("AI mode: scraping start page, then AI chooses same-domain links step-by-step...")
+            status.write(f"{ai_provider} mode: scraping start page, then AI chooses same-domain links step-by-step...")
             agent_result = asyncio.run(ai_agent_crawl(
                 start_url=url,
                 task=ai_task,
-                api_key=openai_api_key,
-                model=openai_model,
+                api_key=ai_api_key,
+                model=ai_model,
+                provider=ai_provider,
                 max_pages=int(max_pages),
                 max_depth=int(max_depth),
                 max_ai_links_per_round=int(max_ai_links_per_round),
@@ -1097,8 +1250,8 @@ if run_clicked:
                 keep_duplicates=keep_duplicates,
             ))
             progress.progress(0.70)
-            status.write("Asking AI to extract structured data from crawled pages...")
-            extraction = ai_extract_from_scraped_pages(results, ai_task, openai_api_key, openai_model)
+            status.write(f"Asking {ai_provider} to extract structured data from crawled pages...")
+            extraction = ai_extract_from_scraped_pages(results, ai_task, ai_api_key, ai_model, ai_provider)
             progress.progress(1.0)
             if extraction.get("error"):
                 st.error(extraction["error"])
