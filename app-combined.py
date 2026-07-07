@@ -58,11 +58,18 @@ OPENAI_PRICING = {
 }
 DEFAULT_PRICING_MODEL = "gpt-4o-mini"
 
+GEMINI_PRICING = {
+    "gemini-2.5-flash-lite": {"input": 0.10, "cached_input": 0.01, "output": 0.40},
+    "gemini-2.5-flash": {"input": 0.30, "cached_input": 0.03, "output": 2.50},
+    "gemini-2.0-flash": {"input": 0.10, "cached_input": 0.01, "output": 0.40},
+}
+
+DEFAULT_GEMINI_PRICING_MODEL = "gemini-2.5-flash-lite"
+
 GEMINI_MODELS = [
+    "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
-    "gemini-2.5-pro",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
 ]
 
 
@@ -623,26 +630,49 @@ def openai_json_call(api_key: str, model: str, messages: list[dict], schema_name
 
     return {"data": extract_json_from_text(output_text), "usage": cost}
 
-
 def estimate_gemini_usage(model: str, usage_metadata) -> dict:
+    pricing = GEMINI_PRICING.get(model)
+    pricing_model = model
+
+    if pricing is None:
+        pricing = GEMINI_PRICING[DEFAULT_GEMINI_PRICING_MODEL]
+        pricing_model = f"{DEFAULT_GEMINI_PRICING_MODEL} (fallback)"
+
     input_tokens = getattr(usage_metadata, "prompt_token_count", 0) or 0
+    cached_input = getattr(usage_metadata, "cached_content_token_count", 0) or 0
     output_tokens = getattr(usage_metadata, "candidates_token_count", 0) or 0
     total_tokens = getattr(usage_metadata, "total_token_count", input_tokens + output_tokens) or (input_tokens + output_tokens)
+
+    # Gemini output pricing includes thinking tokens.
+    # If thoughts_token_count is not returned, estimate hidden thinking tokens from total_tokens.
+    thinking_tokens = getattr(usage_metadata, "thoughts_token_count", 0) or 0
+    if thinking_tokens == 0:
+        thinking_tokens = max(total_tokens - input_tokens - output_tokens, 0)
+
+    normal_input = max(input_tokens - cached_input, 0)
+    billable_output_tokens = output_tokens + thinking_tokens
+
+    input_cost = (normal_input / 1_000_000) * pricing["input"]
+    cached_cost = (cached_input / 1_000_000) * pricing["cached_input"]
+    output_cost = (billable_output_tokens / 1_000_000) * pricing["output"]
+    total_cost = input_cost + cached_cost + output_cost
 
     return {
         "provider": "Gemini",
         "model_used": model,
-        "pricing_model": "N/A - Gemini pricing is not calculated by this app",
+        "pricing_model": pricing_model,
         "input_tokens": input_tokens,
-        "normal_input_tokens": input_tokens,
-        "cached_input_tokens": 0,
+        "normal_input_tokens": normal_input,
+        "cached_input_tokens": cached_input,
         "output_tokens": output_tokens,
+        "thinking_tokens": thinking_tokens,
+        "billable_output_tokens": billable_output_tokens,
         "total_tokens": total_tokens,
-        "input_cost_usd": None,
-        "cached_input_cost_usd": None,
-        "output_cost_usd": None,
-        "estimated_total_cost_usd": None,
-        "pricing_usd_per_1m_tokens": {},
+        "input_cost_usd": round(input_cost, 8),
+        "cached_input_cost_usd": round(cached_cost, 8),
+        "output_cost_usd": round(output_cost, 8),
+        "estimated_total_cost_usd": round(total_cost, 8),
+        "pricing_usd_per_1m_tokens": pricing,
     }
 
 
@@ -681,20 +711,23 @@ def gemini_json_call(api_key: str, model: str, messages: list[dict], schema_name
     output_text = getattr(response, "text", "") or ""
     usage_metadata = getattr(response, "usage_metadata", None)
     usage = estimate_gemini_usage(model, usage_metadata) if usage_metadata else {
-        "provider": "Gemini",
-        "model_used": model,
-        "pricing_model": "N/A - Gemini pricing is not calculated by this app",
-        "input_tokens": 0,
-        "normal_input_tokens": 0,
-        "cached_input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "input_cost_usd": None,
-        "cached_input_cost_usd": None,
-        "output_cost_usd": None,
-        "estimated_total_cost_usd": None,
-        "pricing_usd_per_1m_tokens": {},
-    }
+    "provider": "Gemini",
+    "model_used": model,
+    "pricing_model": f"{DEFAULT_GEMINI_PRICING_MODEL} (fallback)",
+    "input_tokens": 0,
+    "normal_input_tokens": 0,
+    "cached_input_tokens": 0,
+    "output_tokens": 0,
+    "thinking_tokens": 0,
+    "billable_output_tokens": 0,
+    "total_tokens": 0,
+    "input_cost_usd": 0,
+    "cached_input_cost_usd": 0,
+    "output_cost_usd": 0,
+    "estimated_total_cost_usd": 0,
+    "pricing_usd_per_1m_tokens": GEMINI_PRICING[DEFAULT_GEMINI_PRICING_MODEL],
+}
+    
 
     if not output_text:
         return {"error": "Gemini returned an empty response.", "usage": usage}
@@ -893,7 +926,7 @@ async def ai_agent_crawl(
             break
 
         max_new = min(max_ai_links_per_round, max_pages - len(results))
-        selection = ai_choose_next_links(start_url, task, visited_urls, candidates, api_key, model, max_new)
+        selection = ai_choose_next_links(start_url, task, visited_urls, candidates, api_key, model, max_new, provider)    
         selections.append(selection)
         if selection.get("usage"):
             usages.append(selection["usage"])
@@ -984,8 +1017,7 @@ def render_usage_panel(usage: dict):
     c4.metric("📤 Output Tokens", f"{usage.get('output_tokens', 0):,}")
     c5.metric("🔢 Total Tokens", f"{usage.get('total_tokens', 0):,}")
 
-    if usage.get("provider") == "Gemini":
-        st.caption("Gemini token usage is shown when returned by the API. Cost is not estimated in this app.")
+    
 
     with st.expander("🔍 Full cost breakdown"):
         st.json(usage)
